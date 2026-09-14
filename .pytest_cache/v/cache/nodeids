@@ -1,0 +1,10 @@
+[
+  "tests/test_chunking.py::test_chunk_ids_are_unique",
+  "tests/test_chunking.py::test_chunk_pages_preserves_metadata",
+  "tests/test_chunking.py::test_chunk_pages_respects_chunk_size_roughly",
+  "tests/test_chunking.py::test_empty_pages_produce_no_chunks",
+  "tests/test_prompt_template.py::test_build_context_block_handles_empty_list",
+  "tests/test_prompt_template.py::test_build_context_block_includes_source_and_page",
+  "tests/test_prompt_template.py::test_build_user_prompt_includes_question_and_context",
+  "tests/test_prompt_template.py::test_system_prompt_enforces_grounding_rules"
+]
