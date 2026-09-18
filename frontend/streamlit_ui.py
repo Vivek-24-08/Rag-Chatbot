@@ -1,265 +1,127 @@
-# ==============================================================================
-# frontend/streamlit_ui.py
-# ------------------------------------------------------------------------------
-# STEP 1 & 10 of the RAG pipeline: "Upload PDF files" + "Display answer with
-# citations in Streamlit"
-#
-# WHAT THIS FILE DOES:
-#   Builds the entire user-facing chat application: a sidebar for uploading
-#   insurance PDFs, and a main chat window where the user asks questions and
-#   sees grounded answers with source citations underneath each response.
-#
-# HOW STREAMLIT WORKS (GenAI / web beginners):
-#   Streamlit re-runs this ENTIRE script from top to bottom every time the
-#   user interacts with a widget (clicks a button, types a message, etc.).
-#   That means any data we want to "remember" between interactions — like
-#   chat history, or whether the RAG pipeline has already been initialized —
-#   must be stored in `st.session_state`, a dictionary-like object Streamlit
-#   preserves across re-runs for a given browser session.
-# ==============================================================================
-
-import os
-import sys
+"""Local single-owner UI. Do not expose this application as a public multi-user service."""
+import tempfile
 import uuid
-
+from pathlib import Path
 import streamlit as st
+from rag.rag_pipeline import RAGPipeline
+from utils.config import settings
 
-# Allow "import rag.rag_pipeline" etc. to work when this file is run
-# directly via `streamlit run frontend/streamlit_ui.py` from the project
-# root, by adding the project root to Python's module search path.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+def render_message(message, pipeline):
+    with st.chat_message(message["role"]):
+        # Plain text avoids rendering document/model-controlled hyperlinks or remote images.
+        st.text(message["content"])
+        for warning in message.get("warnings", []):
+            st.warning(warning)
+        if message.get("sources"):
+            with st.expander("Evidence and citations"):
+                for source in message["sources"]:
+                    st.text(f"{source.source_file} — physical page/entry {source.page_number}")
+                    st.caption(f"Hybrid ranking score: {source.similarity_score:.4f} (not confidence)")
+                    st.text(source.text)
+                    payload = pipeline.chroma_manager.document_payload(source.document_id)
+                    if payload:
+                        st.download_button("Download original", payload, file_name=source.source_file,
+                            key="download_" + message["id"] + "_" + source.chunk_id)
+        if message.get("search_id"):
+            left, right = st.columns(2)
+            for column, label, rating in ((left, "Helpful", 1), (right, "Not helpful", -1)):
+                if column.button(label, key=message["id"] + str(rating)):
+                    saved = pipeline.search_intelligence.record_feedback(
+                        message["search_id"], rating, st.session_state.session_id)
+                    if saved:
+                        message["feedback"] = rating
+                    else:
+                        st.warning("Feedback could not be saved.")
+            if message.get("feedback"):
+                st.caption("Feedback saved. You can change your rating.")
 
-from rag.rag_pipeline import RAGPipeline, RAGResponse  # noqa: E402
-from utils.config import settings  # noqa: E402
-from utils.logger import get_logger  # noqa: E402
-
-logger = get_logger(__name__)
-
-
-def _init_session_state() -> None:
-    """
-    Set up st.session_state defaults exactly once per browser session.
-    Streamlit re-runs this whole script on every interaction, so we must
-    guard each key with an "if ... not in st.session_state" check —
-    otherwise things like chat history would reset on every message.
-    """
-    if "rag_pipeline" not in st.session_state:
-        # Building the RAGPipeline connects to OpenAI + opens ChromaDB, so
-        # we only want to do this ONCE per session, not on every re-run.
-        with st.spinner("Starting up the Insurance Virtual Assistant..."):
-            st.session_state.rag_pipeline: RAGPipeline = RAGPipeline()
-
-    if "chat_history" not in st.session_state:
-        # Each entry: {"role": "user"|"assistant", "content": str, "sources": [...]}
-        st.session_state.chat_history = []
-    if "search_session_id" not in st.session_state:
-        st.session_state.search_session_id = str(uuid.uuid4())
-
-    if "documents_ingested" not in st.session_state:
-        st.session_state.documents_ingested = st.session_state.rag_pipeline.retriever.has_documents()
-
-
-def _render_sidebar() -> None:
-    """
-    Renders the sidebar: PDF upload widget + ingestion status + a "clear
-    knowledge base" utility button. This is where Step 1 (Upload PDF files)
-    happens from the user's point of view.
-    """
+def run_app():
+    if "pipeline" not in st.session_state:
+        st.session_state.pipeline = RAGPipeline()
+        st.session_state.messages = []
+        st.session_state.session_id = str(uuid.uuid4())
+    pipeline = st.session_state.pipeline
+    manager = pipeline.chroma_manager
+    st.title("Insurance Document Assistant")
+    st.caption("Search your documents with meaning + keywords. Verify important coverage details with your insurer.")
     with st.sidebar:
-        st.header("📄 Upload Insurance Documents")
-        st.caption(
-            "Upload your Evidence of Coverage (EOC), Summary of Benefits "
-            "and Coverage (SBC), Medicare Managed Care Manual, or other plan "
-            "documents (PDF only)."
-        )
-        with st.expander("📈 Search quality"):
-            summary = st.session_state.rag_pipeline.search_intelligence.summary()
-            st.metric("Searches recorded", summary["searches"])
-            if summary["positive_rate"] is not None:
-                st.metric("Positive feedback", f"{summary['positive_rate']:.0%}")
-
-        uploaded_files = st.file_uploader(
-            "Choose PDF file(s)",
-            type=["pdf"],
-            accept_multiple_files=True,
-            help="You can select multiple PDFs at once.",
-        )
-
-        if uploaded_files and st.button("📥 Ingest Documents", type="primary"):
-            _handle_ingestion(uploaded_files)
-
-        st.divider()
-
-        # Status indicator so the user always knows whether the chatbot has
-        # anything to search yet.
-        doc_count = st.session_state.rag_pipeline.chroma_manager.document_count()
-        if doc_count > 0:
-            st.success(f"✅ Knowledge base ready — {doc_count} chunks indexed")
-        else:
-            st.warning("⚠️ No documents indexed yet")
-
-        if st.button("🗑️ Clear knowledge base"):
-            st.session_state.rag_pipeline.chroma_manager.clear_collection()
-            st.session_state.documents_ingested = False
-            st.session_state.chat_history = []
-            st.success("Knowledge base cleared.")
+        st.header("Documents")
+        st.caption("Local, single-owner workspace. Documents are shared by all browser sessions on this installation.")
+        plan = st.text_input("Plan name")
+        year = st.text_input("Plan year")
+        files = st.file_uploader("PDF, text, Markdown or FAQ JSON", type=["pdf","txt","md","json"],
+                                 accept_multiple_files=True)
+        records = manager.list_documents()
+        labels = {d["id"]: f'{d["source"]} | {d["plan"] or "unlabelled"} | {d["year"] or "no year"} | {d["version"][:8]}' for d in records}
+        replacement = st.selectbox("Replace an existing document (optional)", [""] + list(labels),
+                                    format_func=lambda x: labels.get(x, "Add as new"))
+        if st.button("Index documents", disabled=not files):
+            if replacement and len(files) != 1:
+                st.error("Select one upload when replacing a document.")
+            else:
+                with st.spinner("Reading and indexing..."):
+                    total, failures = 0, []
+                    for uploaded in files:
+                        # Each upload gets a separate temporary directory; never use an upload's path.
+                        with tempfile.TemporaryDirectory(prefix="rag-upload-") as staging:
+                            name = uploaded.name.replace("\\", "/").split("/")[-1]
+                            path = Path(staging) / name
+                            path.write_bytes(uploaded.getvalue())
+                            total += pipeline.ingest_documents([path], plan, year, replacement or None)
+                            failures.extend(pipeline.last_ingestion_errors)
+                            for warning in pipeline.last_ingestion_warnings:
+                                st.warning(warning)
+                    if total:
+                        st.success(f"Stored {total} chunks. Reselect documents below if needed.")
+                    for failure in failures:
+                        st.error(f'{failure["source"]}: failed while {failure["stage"]} ({failure["error"]}). Check file format, readable text, size and embedding model availability.')
+                    if manager.last_vector_error:
+                        st.warning("Vector indexing failed. Saved keyword search remains available; use Repair vectors.")
+                records = manager.list_documents()
+                labels = {d["id"]: f'{d["source"]} | {d["plan"]} | {d["year"]} | {d["version"][:8]}' for d in records}
+        selected = st.multiselect("Documents to search", list(labels), default=list(labels),
+                                  format_func=lambda x: labels[x])
+        st.caption(f"{len(records)} documents / {manager.document_count()} chunks stored")
+        if manager.last_vector_error:
+            st.warning("The vector index needs repair. Keyword search can still use the saved documents.")
+        if st.button("Repair vectors"):
+            if manager.sync_vectors():
+                st.success("Vector index ready.")
+            else:
+                st.error("Vector repair failed. Check embedding dependencies/model access.")
+        delete = st.selectbox("Document to remove", [""] + list(labels), format_func=lambda x: labels.get(x, "None"))
+        confirm = st.checkbox("Confirm deletion from this application's current document store")
+        if st.button("Remove selected document", disabled=not delete or not confirm):
+            manager.remove_document(delete)
+            st.session_state.messages = []
             st.rerun()
-
-        st.divider()
-        st.caption(
-            f"**Chat model:** {settings.chat_model}  \n"
-            f"**Embedding model:** {settings.embedding_model}  \n"
-            f"**Top-K retrieval:** {settings.retrieval_top_k}"
-        )
-
-
-def _handle_ingestion(uploaded_files) -> None:
-    """
-    Save each Streamlit UploadedFile to disk (data/pdfs/), then run the
-    RAGPipeline's ingest_documents() to extract, chunk, embed, and store
-    them in ChromaDB. This bridges Streamlit's in-memory upload objects to
-    the file-path-based ingestion pipeline (ingestion/pdf_loader.py expects
-    real file paths on disk, since PyMuPDF reads from disk).
-    """
-    os.makedirs(settings.pdf_upload_dir, exist_ok=True)
-    saved_paths = []
-
-    for uploaded_file in uploaded_files:
-        save_path = os.path.join(settings.pdf_upload_dir, uploaded_file.name)
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        saved_paths.append(save_path)
-
-    with st.spinner(f"Processing {len(saved_paths)} document(s): extracting text, chunking, and generating embeddings..."):
-        try:
-            chunk_count = st.session_state.rag_pipeline.ingest_documents(saved_paths)
-            st.session_state.documents_ingested = True
-            st.success(f"✅ Successfully indexed {chunk_count} chunks from {len(saved_paths)} document(s)!")
-        except Exception as exc:
-            logger.exception("Ingestion failed")
-            st.error(f"❌ Something went wrong while processing your documents: {exc}")
-
-
-def _render_chat_history() -> None:
-    """
-    Redraw every past message in the conversation (Streamlit re-runs the
-    script on every interaction, so without this the chat would appear to
-    "forget" everything after each new message).
-    """
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message["role"] == "assistant" and message.get("sources"):
-                _render_citations(message["sources"])
-                _render_feedback(message)
-
-
-def _render_feedback(message) -> None:
-    if not message.get("search_id") or message.get("feedback"):
-        return
-    left, right = st.columns(2)
-    if left.button("👍 Helpful", key=f"up_{message['search_id']}"):
-        st.session_state.rag_pipeline.search_intelligence.record_feedback(message["search_id"], 1)
-        message["feedback"] = 1
+        if st.button("Clear current knowledge base", disabled=not confirm):
+            manager.clear_collection()
+            st.session_state.messages = []
+            pipeline.search_intelligence.forget_session(st.session_state.session_id)
+            st.rerun()
+        if st.button("Clear this chat and its feedback"):
+            pipeline.search_intelligence.forget_session(st.session_state.session_id)
+            st.session_state.messages = []
+            st.session_state.session_id = str(uuid.uuid4())
+            st.rerun()
+        st.caption(f"Chat: {settings.chat_provider} / {settings.active_chat_model}")
+        st.caption(f"Embeddings: {settings.embedding_provider} / {settings.active_embedding_model}")
+        with st.expander("Search performance"):
+            summary = pipeline.search_intelligence.summary()
+            if not summary["enabled"]:
+                st.caption("Analytics/feedback persistence is off. Enable SEARCH_ANALYTICS_ENABLED in .env to opt in.")
+            else:
+                st.json(summary)
+                st.caption("No question text is stored. Feedback adjusts cited documents within this browser session.")
+    for message in st.session_state.messages:
+        render_message(message, pipeline)
+    question = st.chat_input("Ask about the selected plan", max_chars=4000)
+    if question and question.strip():
+        history = list(st.session_state.messages)
+        st.session_state.messages.append(dict(role="user", content=question, id=str(uuid.uuid4())))
+        with st.spinner("Searching and checking citations..."):
+            response = pipeline.ask(question, st.session_state.session_id, history, selected)
+        st.session_state.messages.append(dict(role="assistant", content=response.answer,
+            sources=response.sources, search_id=response.search_id, warnings=response.warnings, id=str(uuid.uuid4())))
         st.rerun()
-    if right.button("👎 Not helpful", key=f"down_{message['search_id']}"):
-        st.session_state.rag_pipeline.search_intelligence.record_feedback(message["search_id"], -1)
-        message["feedback"] = -1
-        st.rerun()
-
-
-def _render_citations(sources) -> None:
-    """
-    STEP 10: Display answer with citations.
-
-    Renders an expandable "Sources" panel underneath an assistant's answer,
-    listing exactly which document + page each retrieved chunk came from,
-    plus a preview of the chunk text itself — so the user can verify the
-    chatbot's answer against the original document.
-    """
-    with st.expander(f"📚 Sources ({len(sources)})"):
-        for i, chunk in enumerate(sources, start=1):
-            st.markdown(
-                f"**{i}. {chunk.source_file} — page {chunk.page_number}** "
-                f"_(hybrid retrieval score: {chunk.similarity_score:.4f}, higher = more relevant)_"
-            )
-            preview = chunk.text[:400] + ("..." if len(chunk.text) > 400 else "")
-            st.caption(preview)
-
-
-def _render_chat_input() -> None:
-    """
-    The main chat input box at the bottom of the page. When the user submits
-    a question, this triggers Steps 6-9 via RAGPipeline.ask(), then displays
-    the grounded answer + citations (Step 10).
-    """
-    question = st.chat_input("Ask a question about your insurance plan...")
-    if not question:
-        return
-
-    # 1. Show the user's own message immediately and save it to history.
-    st.session_state.chat_history.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    # 2. Run the RAG pipeline (Steps 6-9) and stream the "thinking" state.
-    with st.chat_message("assistant"):
-        with st.spinner("Searching your documents and drafting an answer..."):
-            try:
-                response: RAGResponse = st.session_state.rag_pipeline.ask(
-                    question, st.session_state.search_session_id, st.session_state.chat_history[:-1]
-                )
-            except Exception as exc:
-                logger.exception("RAG pipeline failed to answer")
-                response = RAGResponse(
-                    answer=f"⚠️ Sorry, something went wrong while generating an answer: {exc}",
-                    sources=[],
-                )
-
-        st.markdown(response.answer)
-        if response.sources:
-            _render_citations(response.sources)
-
-    # 3. Save the assistant's turn to history so it survives the next re-run.
-    st.session_state.chat_history.append(
-        {"role": "assistant", "content": response.answer, "sources": response.sources,
-         "search_id": response.search_id, "search_intent": response.search_intent}
-    )
-
-
-def run_app() -> None:
-    """Main entry point for the Streamlit application."""
-    st.set_page_config(
-        page_title="Insurance Virtual Assistant",
-        page_icon="🏥",
-        layout="wide",
-    )
-
-    st.title("🏥 Insurance Virtual Assistant")
-    st.caption(
-        "Ask questions about your plan's benefits, coverage, copays, deductibles, "
-        "claims, appeals, and more — answered strictly from your uploaded documents."
-    )
-
-    _init_session_state()
-    _render_sidebar()
-
-    if not st.session_state.documents_ingested:
-        st.info(
-            "👋 Welcome! To get started, upload your insurance documents "
-            "(EOC, SBC, etc.) using the sidebar on the left, then ask me anything."
-        )
-
-    _render_chat_history()
-    _render_chat_input()
-
-
-# When this module is the Streamlit entry point (e.g. `streamlit run
-# frontend/streamlit_ui.py`), call run_app() automatically.  When imported
-# from app.py, the caller invokes run_app() explicitly so that Streamlit
-# re-runs work correctly (Python caches imports, so a module-level call
-# would only fire once).
-if __name__ == "__main__":
-    run_app()

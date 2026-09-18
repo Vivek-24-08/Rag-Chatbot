@@ -1,128 +1,100 @@
-# ==============================================================================
-# utils/config.py
-# ------------------------------------------------------------------------------
-# WHAT THIS FILE DOES:
-#   Centralizes all configuration in one place. Every other module in this
-#   project imports settings (API keys, model names, folder paths, etc.) from
-#   here instead of reading environment variables directly.
-#
-# WHY THIS MATTERS (GenAI beginners):
-#   RAG apps have a LOT of "knobs" you'll want to tune while experimenting:
-#     - which LLM to call
-#     - which embedding model to use
-#     - how big each text chunk should be
-#     - how many chunks to retrieve per question
-#   Putting them all in one Config object means you can tune the whole
-#   pipeline's behavior by editing ONE file (or even just the .env file)
-#   instead of hunting through every .py file for a hard-coded number.
-# ==============================================================================
-
+"""Validated settings. Relative paths are always relative to the repository."""
 import os
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
 from dotenv import load_dotenv
 
-# load_dotenv() reads the ".env" file in the project root and copies its
-# key=value pairs into the process's environment variables (os.environ).
-# This keeps secrets (like API keys) OUT of the source code.
-load_dotenv()
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 
+def env(name, default="", cast=str):
+    return field(default_factory=lambda: cast(os.getenv(name, default)))
+
+def boolean(value):
+    if str(value).lower() not in {"true", "false"}:
+        raise ValueError("Boolean settings must be true or false.")
+    return str(value).lower() == "true"
 
 @dataclass
 class Config:
-    """
-    A simple, typed container for all app settings.
-
-    Using a dataclass (instead of scattering os.getenv() calls everywhere)
-    gives us:
-      - autocomplete / type hints in your editor
-      - one obvious place to see every setting the app depends on
-      - easy defaults if a .env value is missing
-    """
-
-    # --- OpenAI credentials & model choices ---------------------------------
-    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    chat_model: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
-    embedding_model: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
-
-    # --- Vector store (ChromaDB) settings ------------------------------------
-    chroma_persist_dir: str = os.getenv("CHROMA_PERSIST_DIR", "data/chroma_db")
-    chroma_collection_name: str = os.getenv("CHROMA_COLLECTION_NAME", "insurance_docs")
-
-    # --- Chunking settings ----------------------------------------------------
-    # CHUNK_SIZE: how many characters go into each chunk of text.
-    # CHUNK_OVERLAP: how many characters two consecutive chunks share, so a
-    #                sentence that spans a chunk boundary isn't lost entirely.
-    chunk_size: int = int(os.getenv("CHUNK_SIZE", 1000))
-    chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", 200))
-
-    # --- Retrieval settings -----------------------------------------------------
-    # RETRIEVAL_TOP_K: how many of the most-similar chunks we hand to the LLM
-    # as context for each question.
-    retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", 5))
-    retrieval_candidate_k: int = int(os.getenv("RETRIEVAL_CANDIDATE_K", 20))
-    hybrid_rrf_k: int = int(os.getenv("HYBRID_RRF_K", 60))
-    hybrid_vector_weight: float = float(os.getenv("HYBRID_VECTOR_WEIGHT", 1.0))
-    hybrid_lexical_weight: float = float(os.getenv("HYBRID_LEXICAL_WEIGHT", 1.0))
-
-    # Search-quality data remains local and can be disabled through .env.
-    search_analytics_db: str = os.getenv("SEARCH_ANALYTICS_DB", "data/search_analytics.db")
-    search_analytics_enabled: bool = os.getenv("SEARCH_ANALYTICS_ENABLED", "true").lower() == "true"
-    feedback_source_boost: float = float(os.getenv("FEEDBACK_SOURCE_BOOST", 0.15))
-    lexical_index_path: str = os.getenv("LEXICAL_INDEX_PATH", "data/lexical_search.db")
-
-    # --- File storage paths -------------------------------------------------
-    pdf_upload_dir: str = os.getenv("PDF_UPLOAD_DIR", "data/pdfs")
-
-    # --- Embedding provider ---------------------------------------------------
-    # "openai" uses OpenAI text-embedding-3-large (requires API key + credits)
-    # "local"  uses HuggingFace all-MiniLM-L6-v2 (free, runs on CPU, no key)
-    # Default: auto-detect based on whether OPENAI_API_KEY is set.
-    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "")
-
-    # Local embedding model (only used when embedding_provider == "local")
-    local_embedding_model: str = os.getenv(
-        "LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2"
-    )
-
-    # --- Chat (LLM) provider ---------------------------------------------------
-    # "openai"     uses OpenAI GPT-4o (requires API key + credits)
-    # "databricks" uses Databricks Foundation Model APIs (free within workspace)
-    # Default: auto-detect based on whether OPENAI_API_KEY is set.
-    chat_provider: str = os.getenv("CHAT_PROVIDER", "")
-
-    # Databricks serving endpoint (only used when chat_provider == "databricks")
-    databricks_chat_endpoint: str = os.getenv(
-        "DATABRICKS_CHAT_ENDPOINT", "databricks-meta-llama-3-3-70b-instruct"
-    )
+    openai_api_key: str = env("OPENAI_API_KEY")
+    openrouter_api_key: str = env("OPENROUTER_API_KEY")
+    chat_provider: str = env("CHAT_PROVIDER", "none")
+    chat_model: str = env("OPENAI_CHAT_MODEL", "gpt-4o")
+    openrouter_model: str = env("OPENROUTER_MODEL")
+    databricks_chat_endpoint: str = env("DATABRICKS_CHAT_ENDPOINT")
+    embedding_provider: str = env("EMBEDDING_PROVIDER", "local")
+    embedding_model: str = env("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
+    local_embedding_model: str = env("LOCAL_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    chroma_persist_dir: str = env("CHROMA_PERSIST_DIR", "data/chroma_db")
+    chroma_collection_name: str = env("CHROMA_COLLECTION_NAME", "insurance_docs")
+    lexical_index_path: str = env("LEXICAL_INDEX_PATH", "data/lexical_search.db")
+    search_analytics_db: str = env("SEARCH_ANALYTICS_DB", "data/search_analytics.db")
+    pdf_upload_dir: str = env("PDF_UPLOAD_DIR", "data/pdfs")
+    chunk_size: int = env("CHUNK_SIZE", "1000", int)
+    chunk_overlap: int = env("CHUNK_OVERLAP", "200", int)
+    retrieval_top_k: int = env("RETRIEVAL_TOP_K", "5", int)
+    retrieval_candidate_k: int = env("RETRIEVAL_CANDIDATE_K", "20", int)
+    hybrid_rrf_k: int = env("HYBRID_RRF_K", "60", int)
+    hybrid_vector_weight: float = env("HYBRID_VECTOR_WEIGHT", "1", float)
+    hybrid_lexical_weight: float = env("HYBRID_LEXICAL_WEIGHT", "1", float)
+    feedback_source_boost: float = env("FEEDBACK_SOURCE_BOOST", "0.15", float)
+    max_vector_distance: float = env("MAX_VECTOR_DISTANCE", "0.65", float)
+    context_tokens: int = env("CONTEXT_TOKENS", "3500", int)
+    max_answer_tokens: int = env("MAX_ANSWER_TOKENS", "800", int)
+    request_timeout: int = env("REQUEST_TIMEOUT", "60", int)
+    search_analytics_enabled: bool = env("SEARCH_ANALYTICS_ENABLED", "false", boolean)
+    retention_days: int = env("ANALYTICS_RETENTION_DAYS", "30", int)
+    ocr_enabled: bool = env("OCR_ENABLED", "false", boolean)
 
     def __post_init__(self):
-        """Default to local embeddings + Databricks LLM for zero-cost testing."""
-        if not self.embedding_provider:
-            self.embedding_provider = "local"
-        if not self.chat_provider:
-            self.chat_provider = "databricks"
+        if self.chat_provider not in {"none", "openai", "openrouter", "databricks"}:
+            raise ValueError("CHAT_PROVIDER must be none, openai, openrouter or databricks.")
+        if self.embedding_provider not in {"local", "openai"}:
+            raise ValueError("EMBEDDING_PROVIDER must be local or openai.")
+        for name in ("chunk_size", "retrieval_top_k", "retrieval_candidate_k", "hybrid_rrf_k",
+                     "context_tokens", "max_answer_tokens", "request_timeout", "retention_days"):
+            if getattr(self, name) <= 0:
+                raise ValueError(name + " must be positive.")
+        if not 0 <= self.chunk_overlap < self.chunk_size:
+            raise ValueError("CHUNK_OVERLAP must be >= 0 and smaller than CHUNK_SIZE.")
+        for name in ("hybrid_vector_weight", "hybrid_lexical_weight", "feedback_source_boost", "max_vector_distance"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(name + " must be finite and non-negative.")
+        if not self.hybrid_vector_weight + self.hybrid_lexical_weight:
+            raise ValueError("At least one hybrid weight must be positive.")
+        if self.feedback_source_boost > 0.25:
+            raise ValueError("FEEDBACK_SOURCE_BOOST is a fraction, limited to 0.25.")
+        for name in ("chroma_persist_dir", "lexical_index_path", "search_analytics_db", "pdf_upload_dir"):
+            path = Path(getattr(self, name))
+            setattr(self, name, str(path if path.is_absolute() else ROOT / path))
 
     @property
-    def has_openai_key(self) -> bool:
-        """Check whether a real OpenAI API key is configured."""
-        return bool(
-            self.openai_api_key
-            and not self.openai_api_key.startswith("sk-REPLACE")
-        )
+    def active_chat_model(self):
+        return {"openrouter": self.openrouter_model, "databricks": self.databricks_chat_endpoint,
+                "openai": self.chat_model, "none": "Not configured"}[self.chat_provider]
 
-    def validate(self) -> None:
-        """
-        Raise a clear, human-readable error early if required settings are
-        missing, instead of letting the app crash later with a cryptic
-        "401 Unauthorized" deep inside the OpenAI SDK.
-        """
+    @property
+    def active_embedding_model(self):
+        return self.local_embedding_model if self.embedding_provider == "local" else self.embedding_model
+
+    @property
+    def has_openai_key(self):
+        return bool(self.openai_api_key and "REPLACE" not in self.openai_api_key)
+
+    def validate(self):
         if not self.has_openai_key:
-            raise ValueError(
-                "OPENAI_API_KEY is not set. Copy .env.example to .env and add "
-                "your real OpenAI API key before running the app."
-            )
+            raise ValueError("Set OPENAI_API_KEY in .env for OpenAI embeddings.")
 
+    def validate_chat(self):
+        if self.chat_provider == "none":
+            raise ValueError("Select a chat provider in .env. Document search is available without one.")
+        if self.chat_provider == "openai":
+            self.validate()
+        if self.chat_provider == "openrouter" and (not self.openrouter_api_key or not self.openrouter_model):
+            raise ValueError("Set OPENROUTER_API_KEY and OPENROUTER_MODEL in .env.")
+        if self.chat_provider == "databricks" and not self.databricks_chat_endpoint:
+            raise ValueError("Set DATABRICKS_CHAT_ENDPOINT and configure Databricks authentication.")
 
-# A single, shared Config instance that every other module can import:
-#     from utils.config import settings
 settings = Config()

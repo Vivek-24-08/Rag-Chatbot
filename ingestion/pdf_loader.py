@@ -1,138 +1,73 @@
-# ==============================================================================
-# ingestion/pdf_loader.py
-# ------------------------------------------------------------------------------
-# STEP 1 & 2 of the RAG pipeline: "Upload PDF files" + "Extract text from PDFs"
-#
-# WHAT THIS FILE DOES:
-#   Takes raw PDF files (e.g., Aetna's Evidence of Coverage, Summary of
-#   Benefits and Coverage) and converts them into plain text that the rest
-#   of the pipeline can work with — LLMs and embedding models understand
-#   text, not PDF byte streams.
-#
-# WHY PyMuPDF (imported as "fitz"):
-#   PyMuPDF is fast and preserves page structure well, which lets us tag
-#   every chunk of text with the PAGE NUMBER it came from. That page number
-#   is what eventually powers the "citations" feature in the Streamlit UI —
-#   so a user asking "what's my deductible?" can see it was found on
-#   page 14 of the EOC, not just take the chatbot's word for it.
-#
-# HOW THIS FITS INTO THE BIGGER RAG PICTURE:
-#   PDF file  --(this file)-->  plain text + metadata  --(chunking)-->
-#   text chunks  --(embeddings)-->  vectors  --(vectorstore)--> ChromaDB
-# ==============================================================================
-
-import os
+"""PDF text/table extraction with optional Tesseract OCR and explicit failures."""
 from dataclasses import dataclass, field
-from typing import List
-
-import fitz  # PyMuPDF's import name is "fitz" (its historical codename)
-
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
-
+from pathlib import Path
+import hashlib
+import re
+import fitz
 
 @dataclass
 class PageContent:
-    """
-    Holds the extracted text for a single PDF page, plus metadata about
-    where it came from. We keep metadata attached to every piece of text
-    from the very first step, so it can travel all the way through
-    chunking -> embedding -> vector storage -> retrieval -> final citation.
-    """
-
     text: str
-    page_number: int          # 1-indexed page number (human-friendly)
-    source_file: str          # original PDF filename, e.g. "Aetna_EOC_2026.pdf"
+    page_number: int
+    source_file: str
     metadata: dict = field(default_factory=dict)
 
-
 class PDFLoader:
-    """
-    Loads one or more PDF files from disk and extracts their text,
-    page by page, using PyMuPDF.
-    """
+    def __init__(self, ocr_enabled=False):
+        self.ocr_enabled = ocr_enabled
+        self.errors = []
+        self.warnings = []
 
-    def load_pdf(self, file_path: str) -> List[PageContent]:
-        """
-        Extract text from a single PDF file, one PageContent object per page.
-
-        Args:
-            file_path: Path to a .pdf file on disk (e.g., "data/pdfs/eoc.pdf")
-
-        Returns:
-            A list of PageContent objects, one per non-empty page.
-        """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"PDF not found at: {file_path}")
-
-        filename = os.path.basename(file_path)
-        pages: List[PageContent] = []
-
-        # fitz.open() opens the PDF and gives us page-by-page access.
-        # Using a "with" block ensures the file handle is always closed,
-        # even if something goes wrong mid-extraction.
-        with fitz.open(file_path) as doc:
-            logger.info(f"Opened '{filename}' with {doc.page_count} pages")
-
-            for page_index in range(doc.page_count):
-                page = doc.load_page(page_index)
-
-                # get_text("text") returns plain reading-order text.
-                # PyMuPDF also supports "blocks", "words", "html", etc.,
-                # but plain text is what our embedding model needs.
-                raw_text = page.get_text("text")
-                cleaned_text = self._clean_text(raw_text)
-
-                # Skip pages that are blank or contain only whitespace
-                # (common on section-divider pages) — no point embedding
-                # empty content, it just wastes API calls and storage.
-                if not cleaned_text.strip():
-                    continue
-
-                pages.append(
-                    PageContent(
-                        text=cleaned_text,
-                        page_number=page_index + 1,  # humans count from 1, not 0
-                        source_file=filename,
-                        metadata={"source": filename, "page": page_index + 1},
-                    )
-                )
-
-        logger.info(f"Extracted text from {len(pages)} non-empty pages in '{filename}'")
+    def load_pdf(self, file_path):
+        path = Path(file_path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        pages = []
+        self.warnings = []
+        with fitz.open(path) as doc:
+            if doc.needs_pass:
+                raise ValueError("Password-protected PDF. Upload an unlocked copy.")
+            for index, page in enumerate(doc):
+                text = page.get_text("text", sort=True)
+                if not text.strip() and self.ocr_enabled:
+                    try:
+                        text = page.get_text(textpage=page.get_textpage_ocr(full=True))
+                    except Exception:
+                        raise ValueError("OCR requires a working Tesseract installation and language data.")
+                # Preserve table row/column relationships as an additional labeled block.
+                try:
+                    tables = page.find_tables().tables
+                    for table in tables:
+                        rows = table.extract()
+                        text += "\nTABLE (each line is a row):\n" + "\n".join(
+                            " | ".join(str(cell or "").replace("\n", " ") for cell in row) for row in rows)
+                except Exception:
+                    # Plain text remains usable when automatic table detection fails.
+                    self.warnings.append(f"Automatic table extraction failed on physical page {index + 1}.")
+                text = self._clean_text(text)
+                if text:
+                    pages.append(PageContent(text, index + 1, path.name, {
+                        "source": path.name, "page": index + 1,
+                        "page_label": page.get_label() or str(index + 1),
+                        "document_id": digest, "version": digest,
+                    }))
+                else:
+                    self.warnings.append(f"No readable text on physical page {index + 1}; check for a scanned page.")
+        if not pages:
+            raise ValueError("No text found. The PDF is blank or scanned; enable OCR for scanned PDFs.")
+        if self.warnings:
+            for item in pages:
+                item.metadata["extraction_warning"] = " ".join(self.warnings)
         return pages
 
-    def load_multiple_pdfs(self, file_paths: List[str]) -> List[PageContent]:
-        """
-        Convenience method to load and extract text from several PDFs at
-        once (e.g., EOC + SBC + Medicare Managed Care Manual all uploaded
-        together). Returns one combined list of PageContent objects.
-        """
-        all_pages: List[PageContent] = []
+    def load_multiple_pdfs(self, file_paths):
+        pages, self.errors = [], []
         for path in file_paths:
             try:
-                all_pages.extend(self.load_pdf(path))
+                pages.extend(self.load_pdf(path))
             except Exception as exc:
-                # We log and continue rather than crashing the whole batch
-                # if a single malformed/corrupt PDF is uploaded.
-                logger.error(f"Failed to load '{path}': {exc}")
-        return all_pages
+                self.errors.append({"source": Path(path).name, "error": type(exc).__name__})
+        return pages
 
     @staticmethod
-    def _clean_text(text: str) -> str:
-        """
-        Light text cleanup applied to every extracted page:
-          - collapse repeated whitespace/newlines that PDFs often produce
-            (e.g., from multi-column layouts or table extraction quirks)
-          - strip leading/trailing whitespace
-
-        We keep this intentionally minimal: aggressive cleaning can
-        accidentally delete meaningful content (like "$0 copay" formatting),
-        which would hurt answer accuracy.
-        """
-        # Replace 3+ consecutive newlines with just 2 (paragraph break)
-        import re
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        # Collapse runs of spaces/tabs into a single space
-        text = re.sub(r"[ \t]{2,}", " ", text)
-        return text.strip()
+    def _clean_text(text):
+        return re.sub(r"[ \t]{2,}", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()

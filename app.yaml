@@ -1,13 +1,11 @@
+# Example only: configure authentication and durable storage before deployment.
+# Local-first defaults intentionally do not include keys or a secret resource name.
 command:
   - "streamlit"
   - "run"
   - "app.py"
-
 env:
-  - name: OPENAI_API_KEY
-    description: "OpenAI API key for GPT-4o chat (embeddings use local model)"
-    valueFrom: "secopenai-keyret"
   - name: EMBEDDING_PROVIDER
     value: "local"
   - name: CHAT_PROVIDER
-    value: "databricks"
+    value: "none"

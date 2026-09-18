@@ -1,211 +1,223 @@
-# ==============================================================================
-# vectorstore/chroma_manager.py
-# ------------------------------------------------------------------------------
-# STEP 5 of the RAG pipeline: "Store embeddings in vector database"
-#
-# WHAT IS A VECTOR DATABASE? (GenAI beginners)
-#   A normal database is great at exact lookups ("find the row where
-#   id = 42"). A VECTOR database is built for a different kind of lookup:
-#   "find the vectors that are mathematically closest to THIS vector."
-#   That "closeness" search is called a SIMILARITY SEARCH, and it's the
-#   engine behind RAG retrieval — see retrieval/retriever.py for Step 6.
-#
-# WHY ChromaDB SPECIFICALLY:
-#   ChromaDB is open-source, runs entirely locally (no external service or
-#   account needed), and persists its data to a folder on disk
-#   (data/chroma_db/ in this project), which is perfect for a local-machine
-#   VS Code prototype like this one. It also integrates directly with
-#   LangChain, so we don't have to hand-write vector math ourselves.
-#
-# WHAT GETS STORED PER CHUNK:
-#   For every text chunk we store THREE things together:
-#     1. the embedding vector (for similarity search)
-#     2. the original chunk text (so we can show/send it to the LLM later)
-#     3. metadata: source filename + page number (so we can cite it later)
-#
-# HOW THIS FITS INTO THE BIGGER PICTURE:
-#   chunks + vectors --(this file)--> persisted to disk in data/chroma_db/
-#   Later, at question-answering time, retrieval/retriever.py re-opens this
-#   same persisted database and searches it.
-# ==============================================================================
+"""SQLite is authoritative; Chroma is a repairable, collection-scoped derived index.
 
-import os
+Document replacement + FTS updates commit together. Vector sync holds a SQLite
+write lock, so searches cannot observe an ingestion half-way through the update.
+Old stores are left untouched; v2 uses its own namespace and requires re-ingestion.
+"""
+from contextlib import contextmanager
+from pathlib import Path
+import hashlib
+import json
 import re
 import sqlite3
-from typing import List, Optional
-
-from langchain_chroma import Chroma
+import uuid
 from langchain_core.documents import Document
-
-from chunking.text_splitter import Chunk
-from embeddings.embedding_service import EmbeddingService
 from utils.config import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
 class ChromaManager:
-    """
-    Manages a single persistent ChromaDB collection: creating it, adding
-    document chunks to it, and exposing it for similarity search.
-    """
+    def __init__(self, embedding_service=None, config=None):
+        self.config = config or settings
+        if embedding_service is None:
+            from embeddings.embedding_service import EmbeddingService
+            embedding_service = EmbeddingService(self.config)
+        self.embedding_service = embedding_service
+        scope = hashlib.sha256((self.config.chroma_persist_dir + "/" +
+                                self.config.chroma_collection_name).encode()).hexdigest()[:16]
+        base = Path(self.config.lexical_index_path)
+        self.db_path = base.with_name(base.stem + "-v2-" + scope + ".db")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.collection_name = "rag-v2-" + scope
+        self._collection = None
+        self._client = None
+        self.last_vector_error = ""
+        with self._db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("""CREATE TABLE IF NOT EXISTS documents(
+                id TEXT PRIMARY KEY, source TEXT, plan TEXT, year TEXT, version TEXT,
+                kind TEXT, payload BLOB, updated REAL DEFAULT (strftime('%s','now')))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS chunks(
+                id TEXT PRIMARY KEY, doc_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+                text TEXT NOT NULL, metadata TEXT NOT NULL)""")
+            db.execute("CREATE INDEX IF NOT EXISTS chunks_doc ON chunks(doc_id)")
+            try:
+                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(chunk_id UNINDEXED, content)")
+            except sqlite3.OperationalError:
+                raise ValueError("SQLite FTS5 is unavailable. Use the documented Python 3.11 environment.")
+            version = db.execute("SELECT value FROM state WHERE key='schema'").fetchone()
+            if version and version[0] != "2":
+                raise ValueError("Unsupported document database schema; use a matching application version.")
+            db.execute("INSERT OR IGNORE INTO state VALUES ('schema','2')")
 
-    def __init__(self, embedding_service: Optional[EmbeddingService] = None):
-        # Reuse a shared EmbeddingService if one is passed in (e.g., by the
-        # RAG pipeline that also needs it for embedding the user's
-        # question) — otherwise create a fresh one.
-        self.embedding_service = embedding_service or EmbeddingService()
+    @contextmanager
+    def _db(self):
+        db = sqlite3.connect(str(self.db_path), timeout=30)
+        db.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
-        # Make sure the folder Chroma will write its on-disk database files
-        # into actually exists before we try to use it.
-        os.makedirs(settings.chroma_persist_dir, exist_ok=True)
+    @property
+    def collection(self):
+        if self._client is None:
+            import chromadb
+            from chromadb.config import Settings
+            self._client = chromadb.PersistentClient(path=str(Path(self.config.chroma_persist_dir) / "v2"),
+                                               settings=Settings(anonymized_telemetry=False))
+        return self._client.get_or_create_collection(
+            self.collection_name, metadata={"hnsw:space": "cosine"})
 
-        # LangChain's Chroma wrapper handles:
-        #   - opening (or creating) the on-disk database at persist_directory
-        #   - calling our embedding model whenever .add_documents() or
-        #     .similarity_search() is used
-        self.vectorstore = Chroma(
-            collection_name=settings.chroma_collection_name,
-            embedding_function=self.embedding_service.get_langchain_embeddings(),
-            persist_directory=settings.chroma_persist_dir,
-        )
-        self._initialize_lexical_index()
+    def _sync(self, db):
+        saved = db.execute("SELECT value FROM state WHERE key='revision'").fetchone()
+        revision = saved[0] if saved else "empty"
+        signature = revision + ":" + self.embedding_service.fingerprint
+        collection = self.collection
+        meta = collection.metadata or {}
+        count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        if meta.get("revision") == signature and collection.count() == count:
+            return
+        # Recreate the derived index when embedding dimensions/model change.
+        if meta.get("embedding_model") != self.embedding_service.fingerprint:
+            self._client.delete_collection(self.collection_name)
+            collection = self.collection
+        collection.modify(metadata={"revision": "dirty", "embedding_model": self.embedding_service.fingerprint})
+        current_ids = collection.get(include=[])["ids"]
+        for offset in range(0, len(current_ids), 256):
+            collection.delete(ids=current_ids[offset:offset + 256])
+        cursor = db.execute("SELECT id,text,metadata FROM chunks ORDER BY id")
+        while True:
+            batch = cursor.fetchmany(64)
+            if not batch:
+                break
+            vectors = self.embedding_service.embed_documents([row[1] for row in batch])
+            collection.upsert(ids=[r[0] for r in batch], documents=[r[1] for r in batch],
+                              metadatas=[json.loads(r[2]) for r in batch], embeddings=vectors)
+        collection.modify(metadata={"revision": signature, "embedding_model": self.embedding_service.fingerprint})
+        db.execute("INSERT OR REPLACE INTO state VALUES ('vector_revision',?)", (signature,))
 
-        logger.info(
-            f"ChromaManager ready. Collection='{settings.chroma_collection_name}', "
-            f"persist_dir='{settings.chroma_persist_dir}'"
-        )
+    def sync_vectors(self):
+        try:
+            with self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                self._sync(db)
+            self.last_vector_error = ""
+            return True
+        except Exception as exc:
+            self.last_vector_error = type(exc).__name__
+            logger.warning("vector_sync_failed error=%s", self.last_vector_error)
+            return False
 
-    def add_chunks(self, chunks: List[Chunk]) -> int:
-        """
-        Embed and store a batch of text chunks in ChromaDB.
-
-        Args:
-            chunks: list of Chunk objects from chunking/text_splitter.py
-
-        Returns:
-            The number of chunks successfully added.
-        """
+    def replace_document(self, record, chunks, payload=b""):
         if not chunks:
-            logger.warning("add_chunks() called with an empty chunk list — nothing to do")
-            return 0
-
-        # LangChain's Chroma store expects LangChain "Document" objects:
-        # page_content (the text) + metadata (a dict). Internally, when we
-        # call add_documents(), Chroma will:
-        #   1. call self.embedding_service to turn each chunk's text into a
-        #      vector (this is Step 4 happening again, but batched)
-        #   2. write {vector, text, metadata, id} into the on-disk database
-        documents = [
-            Document(page_content=chunk.text, metadata=chunk.metadata)
-            for chunk in chunks
-        ]
-        ids = [chunk.chunk_id for chunk in chunks]
-
-        logger.info(f"Embedding and storing {len(documents)} chunks in ChromaDB...")
-        self.vectorstore.add_documents(documents=documents, ids=ids)
-        self._upsert_lexical_chunks(chunks)
-        logger.info("Chunks stored successfully (persisted to disk automatically)")
-
-        return len(documents)
-
-    def get_retriever(self, top_k: int = None):
-        """
-        Return a LangChain "retriever" object configured for similarity
-        search. A retriever is just a standardized interface LangChain uses
-        so that different vector stores (Chroma, Pinecone, FAISS, etc.) can
-        all be swapped in and out of a RAG chain without changing other code.
-
-        Args:
-            top_k: how many of the most similar chunks to return per query.
-                   Defaults to settings.retrieval_top_k from utils/config.py.
-        """
-        k = top_k or settings.retrieval_top_k
-        return self.vectorstore.as_retriever(search_kwargs={"k": k})
-
-    def similarity_search_with_scores(self, query: str, top_k: int = None):
-        """
-        Directly run a similarity search and return chunks WITH their
-        similarity scores. Useful when we want to show the user "how
-        confident" the retrieval was, or filter out weak matches.
-
-        Args:
-            query: the (already-plain-text) user question
-            top_k: number of chunks to retrieve
-
-        Returns:
-            List of (Document, score) tuples. For Chroma, a LOWER score
-            means MORE similar (it's a distance metric, not a percentage).
-        """
-        k = top_k or settings.retrieval_top_k
-        return self.vectorstore.similarity_search_with_score(query, k=k)
-
-    def get_all_documents(self) -> List[Document]:
-        """Return persisted chunks for local BM25 keyword retrieval."""
-        stored = self.vectorstore._collection.get(include=["documents", "metadatas"])
-        return [
-            Document(page_content=text, metadata=metadata or {})
-            for text, metadata in zip(stored.get("documents", []), stored.get("metadatas", []))
-            if text
-        ]
-
-    def _lexical_connection(self):
-        os.makedirs(os.path.dirname(settings.lexical_index_path) or ".", exist_ok=True)
-        return sqlite3.connect(settings.lexical_index_path)
-
-    def _initialize_lexical_index(self) -> None:
-        """Create a persistent FTS5 index and rebuild it only when out of sync."""
-        with self._lexical_connection() as connection:
-            connection.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search
-                              USING fts5(chunk_id UNINDEXED, content, source UNINDEXED, page UNINDEXED)""")
-            indexed_count = connection.execute("SELECT COUNT(*) FROM chunk_search").fetchone()[0]
-            vector_count = self.vectorstore._collection.count()
-            if indexed_count == vector_count:
-                return
-            connection.execute("DELETE FROM chunk_search")
-            stored = self.vectorstore._collection.get(include=["documents", "metadatas"])
-            connection.executemany(
-                "INSERT INTO chunk_search VALUES (?, ?, ?, ?)",
-                [(chunk_id, text, (metadata or {}).get("source", "unknown"), str((metadata or {}).get("page", 0)))
-                 for chunk_id, text, metadata in zip(stored.get("ids", []), stored.get("documents", []), stored.get("metadatas", []))
-                 if text],
-            )
-
-    def _upsert_lexical_chunks(self, chunks: List[Chunk]) -> None:
-        with self._lexical_connection() as connection:
+            raise ValueError("Document contains no indexable chunks.")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            old = [r[0] for r in db.execute("SELECT id FROM chunks WHERE doc_id=?", (record["id"],))]
+            db.executemany("DELETE FROM search WHERE chunk_id=?", [(cid,) for cid in old])
+            db.execute("DELETE FROM documents WHERE id=?", (record["id"],))
+            db.execute("""INSERT INTO documents(id,source,plan,year,version,kind,payload)
+                          VALUES (?,?,?,?,?,?,?)""",
+                       tuple(record[k] for k in ("id", "source", "plan", "year", "version", "kind")) + (payload,))
             for chunk in chunks:
-                connection.execute("DELETE FROM chunk_search WHERE chunk_id = ?", (chunk.chunk_id,))
-                connection.execute("INSERT INTO chunk_search VALUES (?, ?, ?, ?)",
-                                   (chunk.chunk_id, chunk.text, chunk.metadata.get("source", "unknown"), str(chunk.metadata.get("page", 0))))
+                meta = {**chunk.metadata, "document_id": record["id"], "chunk_id": chunk.chunk_id,
+                        "plan": record["plan"], "year": record["year"], "source": record["source"]}
+                db.execute("INSERT INTO chunks VALUES (?,?,?,?)",
+                           (chunk.chunk_id, record["id"], chunk.text, json.dumps(meta)))
+                db.execute("INSERT INTO search VALUES (?,?)", (chunk.chunk_id, chunk.text))
+            db.execute("INSERT OR REPLACE INTO state VALUES ('revision',?)", (uuid.uuid4().hex,))
+        # Canonical commit survives vector failures; search can fall back to FTS.
+        self.sync_vectors()
+        return len(chunks)
 
-    def lexical_search(self, query: str, top_k: int) -> List[tuple]:
-        """Use the persisted FTS5/BM25 index; this does not scan every chunk."""
-        terms = re.findall(r"[a-z0-9]+", query.lower())
-        if not terms:
+    def add_chunks(self, chunks):
+        """Compatibility API for programmatic ingestion; grouped by document ID."""
+        groups = {}
+        for chunk in chunks:
+            groups.setdefault(chunk.metadata["document_id"], []).append(chunk)
+        for identity, batch in groups.items():
+            meta = batch[0].metadata
+            self.replace_document({"id": identity, "source": meta.get("source", "unknown"),
+                                   "plan": meta.get("plan", ""), "year": meta.get("year", ""),
+                                   "version": meta.get("version", identity), "kind": "text"}, batch)
+        return len(chunks)
+
+    def list_documents(self):
+        with self._db() as db:
+            rows = db.execute("""SELECT d.id,d.source,d.plan,d.year,d.version,d.kind,count(c.id)
+                                 FROM documents d LEFT JOIN chunks c ON d.id=c.doc_id GROUP BY d.id
+                                 ORDER BY d.source""").fetchall()
+        return [dict(zip(("id","source","plan","year","version","kind","chunks"), row)) for row in rows]
+
+    def document_payload(self, document_id):
+        with self._db() as db:
+            row = db.execute("SELECT payload FROM documents WHERE id=?", (document_id,)).fetchone()
+        return row[0] if row else None
+
+    def remove_document(self, document_id):
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            ids = db.execute("SELECT id FROM chunks WHERE doc_id=?", (document_id,)).fetchall()
+            db.executemany("DELETE FROM search WHERE chunk_id=?", ids)
+            db.execute("DELETE FROM documents WHERE id=?", (document_id,))
+            db.execute("INSERT OR REPLACE INTO state VALUES ('revision',?)", (uuid.uuid4().hex,))
+        self.sync_vectors()
+
+    def clear_collection(self):
+        for record in self.list_documents():
+            self.remove_document(record["id"])
+
+    def document_count(self):
+        with self._db() as db:
+            return db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+
+    def get_all_documents(self):
+        with self._db() as db:
+            rows = db.execute("SELECT text,metadata FROM chunks").fetchall()
+        return [Document(page_content=t, metadata=json.loads(m)) for t,m in rows]
+
+    def similarity_search_with_scores(self, query, top_k=None, document_ids=None):
+        k = top_k or self.config.retrieval_top_k
+        if document_ids == [] or not self.document_count():
             return []
-        match_query = " OR ".join(terms)
-        with self._lexical_connection() as connection:
-            rows = connection.execute("""SELECT content, source, page, -bm25(chunk_search) AS score
-                                         FROM chunk_search WHERE chunk_search MATCH ?
-                                         ORDER BY bm25(chunk_search) LIMIT ?""", (match_query, top_k)).fetchall()
-        return [(Document(page_content=text, metadata={"source": source, "page": int(page)}), float(score))
-                for text, source, page, score in rows]
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._sync(db)
+            where = {"document_id": {"$in": document_ids}} if document_ids else None
+            result = self.collection.query(query_embeddings=[self.embedding_service.embed_query(query)],
+                                           n_results=min(k, self.document_count()),
+                                           where=where, include=["documents","metadatas","distances"])
+        return [(Document(page_content=t, metadata=m), float(d)) for t,m,d in
+                zip(result["documents"][0], result["metadatas"][0], result["distances"][0])]
 
-    def document_count(self) -> int:
-        """Return how many chunks are currently stored in the collection."""
-        return self.vectorstore._collection.count()
+    def lexical_search(self, query, top_k, document_ids=None):
+        # Quoted Unicode tokens cannot become FTS operators. Punctuation is consistently split.
+        terms = list(dict.fromkeys(re.findall(r"[^\W_]+", query.lower(), re.UNICODE)))[:80]
+        if not terms or document_ids == []:
+            return []
+        match = " OR ".join('"' + term + '"' for term in terms)
+        sql = """SELECT c.text,c.metadata,-bm25(search) FROM search
+                 JOIN chunks c ON c.id=search.chunk_id WHERE search MATCH ?"""
+        args = [match]
+        if document_ids:
+            sql += " AND c.doc_id IN (" + ",".join("?" for _ in document_ids) + ")"
+            args.extend(document_ids)
+        sql += " ORDER BY bm25(search),c.id LIMIT ?"
+        args.append(top_k)
+        with self._db() as db:
+            rows = db.execute(sql, args).fetchall()
+        return [(Document(page_content=t, metadata=json.loads(m)), float(score)) for t,m,score in rows]
 
-    def clear_collection(self) -> None:
-        """
-        Delete ALL vectors in the current collection. Useful when a user
-        wants to re-upload documents from scratch rather than accumulating
-        duplicates across sessions.
-        """
-        logger.warning(f"Clearing all vectors from collection '{settings.chroma_collection_name}'")
-        existing_ids = self.vectorstore._collection.get()["ids"]
-        if existing_ids:
-            self.vectorstore._collection.delete(ids=existing_ids)
-        with self._lexical_connection() as connection:
-            connection.execute("DELETE FROM chunk_search")
-        logger.info("Collection cleared")
+    def get_retriever(self, top_k=None):
+        from retrieval.retriever import Retriever
+        manager = self
+        class Adapter:
+            def invoke(self, query):
+                return Retriever(manager, config=manager.config).retrieve(query, top_k=top_k)
+        return Adapter()

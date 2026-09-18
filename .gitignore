@@ -21,3 +21,18 @@ data/pdfs/*
 # OS/editor cruft
 .DS_Store
 .vscode/
+
+# Private configuration and local state (existing tracked files need a separate audit).
+.env
+.env.*
+!.env.example
+!.env.py
+.streamlit/secrets.toml
+.venv/
+*.db
+*.db-*
+*.sqlite*
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/

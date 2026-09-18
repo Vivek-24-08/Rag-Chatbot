@@ -1,64 +1,92 @@
-"""Hybrid semantic and keyword retrieval for insurance documents."""
-from dataclasses import dataclass
+"""Hybrid retrieval: independent candidates, deduplication, bounded adaptation."""
+import hashlib
+import math
 import re
-from typing import Dict, List, Tuple
-
-from langchain_core.documents import Document
+from retrieval.models import RetrievedChunk
 from utils.config import settings
 from utils.logger import get_logger
-from vectorstore.chroma_manager import ChromaManager
 
 logger = get_logger(__name__)
+STOP = set("a an the is are do does what how about my your for of to and or it this that in".split())
 
-
-@dataclass
-class RetrievedChunk:
-    text: str
-    source_file: str
-    page_number: int
-    similarity_score: float  # Fused RRF score; higher is better.
-    vector_distance: float = None
-    lexical_score: float = 0.0
-
+def terms(text):
+    return set(re.findall(r"[^\W_]+", text.lower())) - STOP
 
 class Retriever:
-    def __init__(self, chroma_manager: ChromaManager):
+    def __init__(self, chroma_manager, config=None):
         self.chroma_manager = chroma_manager
+        self.config = config or settings
+        self.last_warnings = []
 
-    @staticmethod
-    def _tokens(text: str) -> List[str]:
-        return re.findall(r"[a-z0-9]+", text.lower())
+    def retrieve(self, question, top_k=None, document_ids=None, weights=None, preferences=None):
+        if not question or not question.strip():
+            raise ValueError("Enter a question.")
+        k = self.config.retrieval_top_k if top_k is None else top_k
+        if type(k) is not int or k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+        weights = weights or (self.config.hybrid_vector_weight, self.config.hybrid_lexical_weight)
+        if len(weights) != 2 or any(not math.isfinite(w) or w < 0 for w in weights) or not sum(weights):
+            raise ValueError("Require two finite non-negative weights with a positive sum.")
+        count = max(k, self.config.retrieval_candidate_k)
+        branches = []
+        self.last_warnings = []
+        for index, method in enumerate((self.chroma_manager.similarity_search_with_scores, self.chroma_manager.lexical_search)):
+            if not weights[index]:
+                branches.append([])
+                continue
+            try:
+                branches.append(method(question, count, document_ids=document_ids))
+            except Exception as exc:
+                branches.append([])
+                self.last_warnings.append(method.__name__ + " unavailable")
+                logger.warning("retrieval_branch_failed error=%s", type(exc).__name__)
+        if len(self.last_warnings) == sum(weight > 0 for weight in weights):
+            raise RuntimeError("All enabled search indexes are unavailable.")
+        fused = {}
+        query_terms = terms(question)
+        for branch, results in enumerate(branches):
+            if weights[branch] == 0:
+                continue
+            seen = set()
+            for rank, (doc, raw_score) in enumerate(results, 1):
+                if not math.isfinite(raw_score):
+                    continue
+                meta = doc.metadata
+                cid = meta.get("chunk_id") or hashlib.sha256(
+                    (str(meta) + doc.page_content).encode()).hexdigest()
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                # Evidence gate: lexical results must share informative words;
+                # semantic-only evidence must meet the configured cosine distance.
+                if branch == 1 and not query_terms.intersection(terms(doc.page_content)):
+                    continue
+                if branch == 0 and raw_score > self.config.max_vector_distance:
+                    continue
+                item = fused.setdefault(cid, RetrievedChunk(
+                    doc.page_content, meta.get("source","unknown"), meta.get("page",0), 0.0,
+                    chunk_id=cid, document_id=meta.get("document_id",""),
+                    page_label=meta.get("page_label","")))
+                item.base_score += weights[branch] / (self.config.hybrid_rrf_k + rank)
+                if branch == 0:
+                    item.vector_distance, item.vector_rank = raw_score, rank
+                else:
+                    item.lexical_score, item.lexical_rank = raw_score, rank
+        for item in fused.values():
+            # At most +/- 25%; applied to all candidates, before top-K truncation.
+            preference = max(-1, min(1, (preferences or {}).get(item.document_id, 0)))
+            item.similarity_score = item.base_score * (1 + self.config.feedback_source_boost * preference)
+        ranked = sorted(fused.values(), key=lambda x: (-x.similarity_score, x.chunk_id))
+        selected = []
+        for item in ranked:
+            if any(item.document_id == other.document_id and
+                   len(terms(item.text) & terms(other.text)) / max(1, len(terms(item.text) | terms(other.text))) > 0.9
+                   for other in selected):
+                continue
+            selected.append(item)
+            if len(selected) == k:
+                break
+        return selected
 
-    @staticmethod
-    def _key(document: Document) -> Tuple[str, str, int]:
-        return document.page_content, str(document.metadata.get("source", "unknown")), int(document.metadata.get("page", 0))
-
-    def _bm25_search(self, question: str, limit: int):
-        return self.chroma_manager.lexical_search(question, limit)
-
-    def retrieve(self, question: str, top_k: int = None) -> List[RetrievedChunk]:
-        k = top_k or settings.retrieval_top_k
-        candidate_k = max(k, settings.retrieval_candidate_k)
-        vector_results = self.chroma_manager.similarity_search_with_scores(question, candidate_k)
-        lexical_results = self._bm25_search(question, candidate_k)
-        fused: Dict[Tuple[str, str, int], Dict] = {}
-
-        for rank, (document, distance) in enumerate(vector_results, 1):
-            result = fused.setdefault(self._key(document), {"document": document, "score": 0.0, "distance": None, "lexical": 0.0})
-            result["score"] += settings.hybrid_vector_weight / (settings.hybrid_rrf_k + rank)
-            result["distance"] = float(distance)
-        for rank, (document, lexical_score) in enumerate(lexical_results, 1):
-            result = fused.setdefault(self._key(document), {"document": document, "score": 0.0, "distance": None, "lexical": 0.0})
-            result["score"] += settings.hybrid_lexical_weight / (settings.hybrid_rrf_k + rank)
-            result["lexical"] = float(lexical_score)
-
-        ranked = sorted(fused.values(), key=lambda result: result["score"], reverse=True)[:k]
-        return [RetrievedChunk(
-            text=result["document"].page_content,
-            source_file=result["document"].metadata.get("source", "unknown"),
-            page_number=result["document"].metadata.get("page", 0),
-            similarity_score=result["score"], vector_distance=result["distance"], lexical_score=result["lexical"],
-        ) for result in ranked]
-
-    def has_documents(self) -> bool:
+    def has_documents(self):
         return self.chroma_manager.document_count() > 0
